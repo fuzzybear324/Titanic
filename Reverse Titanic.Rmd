@@ -1,0 +1,214 @@
+---
+title: "Reverse Titanic"
+output: html_document
+---
+
+
+```{r}
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(randomForest)
+library(mice)
+library(e1071)
+library(gbm)
+```
+
+Importing data, making sure to import blank character data as "NA"s rather than just "" since R thinks these are characters but really they are missing data
+```{r}
+train <- read.csv("Titanic/Data/titanic_train.csv", na.strings = c("", "NA"), stringsAsFactors = F)
+test <- read.csv("Titanic/Data/titanic_test.csv", na.strings = c("", "NA"), stringsAsFactors = F)
+full <- bind_rows(train, test)
+```
+
+#Missing values
+First we see how many values are missing and from which columns
+```{r}
+head(train)
+```
+
+```{r}
+for(i in 1:length(names(train))) {
+  print(sum(is.na(train[,i])))
+}
+```
+Train is missing 177 age values, 687 cabin values, and 2 embarked values. 
+```{r}
+for(i in 1:length(names(test))) {
+  print(sum(is.na(test[,i])))
+}
+```
+Test is missing 86 age values, 1 fare value, and 327 cabin values. 
+
+Since the size of our data is somewhat small, we cannot just remove entire rows which are missing data. So we have to put in some sensible replacements.
+
+First we start with the 2 missing embarked values in train.
+```{r}
+missing_embarked_ind <- which(is.na(train$Embarked))
+train[missing_embarked_ind,]
+```
+The most likely columns which correlate to which port they embarked are fare and passenger class. The fares were 80 and 80 and the Pclass's were 1 and 1. 
+
+We are going to visulize fare, embarked, and p class in one graph.
+```{r}
+missing_embar <- train %>%
+  filter(PassengerId != 62, PassengerId != 830)
+
+ggplot(missing_embar, aes(x = Embarked, y = Fare, fill = factor(Pclass))) +
+  geom_boxplot() +
+  geom_hline(aes(yintercept=80), 
+    colour='red', linetype='dashed', lwd=2)
+```
+From the looks of things, a passenger with a Fare of $80 and a P class of 1 was most likely from C. Thus we'll fill in those NA's with C. 
+
+```{r}
+train$Embarked[missing_embarked_ind] <- "C"
+full$Embarked[missing_embarked_ind] <- "C"
+```
+
+Now for the missing fare value in the test data.
+```{r}
+missing_fare_ind <- which(is.na(test$Fare))
+test[missing_fare_ind,]
+```
+This passenger was in class 3 and embarked from S. Similar to before, we are going to visualize all passengers who were class 3 and embarked from S and see what a good value to stick in is.
+
+```{r}
+ggplot(full[full$Pclass == '3' & full$Embarked == 'S',],
+  aes(x = Fare)) +
+  geom_density() +
+  geom_vline(aes(xintercept = median(Fare, na.rm = T)),
+                 color = 'red', linetype = 'dashed', lwd = 1)
+
+```
+Thus it seems ok to replace the missing value with the median value.
+```{r}
+temp_median_fare <- median(full[full$Pclass == '3' & full$Embarked == 'S',]$Fare , na.rm = T)
+test[missing_fare_ind,]$Fare <- temp_median_fare
+full[missing_fare_ind,]$Fare <- temp_median_fare
+```
+
+
+Now let's start filling in those missing age values. We are going to use the mice package which uses some markov chain based algorithim to fill in the data...or something. 
+```{r}
+#make certain variables factors
+factor_vars <- c('PassengerId','Pclass','Sex','Embarked')
+full[factor_vars] <- lapply(full[factor_vars], factor)
+```
+
+```{r include = FALSE, message = FALSE, warnings = FALSE}
+#perform mice imputation excluding less useful variables 
+mice_mod <- mice(full[, !names(full) %in% c('PassengerId','Name','Ticket','Cabin')], method='rf')
+#save the complete output
+mice_output <- complete(mice_mod)
+```
+Now let's check the results to see if the made up ages seem okay.
+```{r}
+par(mfrow=c(1,2))
+hist(full$Age, freq=F, main='Age: Original Data', 
+  col='darkgreen', ylim=c(0,0.04))
+hist(mice_output$Age, freq=F, main='Age: MICE Output', 
+  col='lightgreen', ylim=c(0,0.04))
+```
+They do so we can replace the age vector with the mice model output.
+
+```{r}
+full$Age <- mice_output$Age
+```
+
+Now we split the full set back into training and test.
+```{r}
+train <- full[1:891,]
+test <- full[892:1309,]
+```
+
+#Random Forest
+Build model using random forest
+```{r}
+rf_model <- randomForest(factor(Survived) ~ Pclass + Sex + Age + SibSp + Parch + Fare + Embarked, data = train)
+
+#show model error
+plot(rf_model, ylim=c(0,0.36))
+legend('topright', colnames(rf_model$err.rate), col=1:3, fill=1:3)
+
+```
+Black line is overall error rate, red is for died, and green is for survived. 
+
+Now let's check variable importance.
+```{r}
+importance <- importance(rf_model)
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[ ,'MeanDecreaseGini'],2))
+
+# Create a rank variable based on importance
+rankImportance <- varImportance %>%
+  mutate(Rank = paste0('#',dense_rank(desc(Importance))))
+
+# Use ggplot2 to visualize the relative importance of variables
+ggplot(rankImportance, aes(x = reorder(Variables, Importance), 
+    y = Importance, fill = Importance)) +
+  geom_bar(stat='identity') + 
+  geom_text(aes(x = Variables, y = 0.5, label = Rank),
+    hjust=0, vjust=0.55, size = 4, colour = 'red') +
+  labs(x = 'Variables') +
+  coord_flip()
+```
+
+Now we make our prediction with random forest.
+```{r}
+prediction_rf <- predict(rf_model,test)
+```
+
+
+#SVM 
+Use SVM (good with small datasets)
+```{r}
+svm_model <- train(factor(Survived) ~ Sex + Fare + Age + Pclass + SibSp + Parch + Embarked, data = train, method = 'svmRadial')
+prediction_SVM <- predict(svm_model, test)
+```
+
+
+#GBM
+Got to use 1 boosting algorithim somewhere
+```{r}
+boost_model <- train(factor(Survived) ~ Sex + Fare + Age + Pclass + SibSp + Parch + Embarked, data = train, method = 'gbm')
+prediction_GBM <- predict(boost_model, test)
+```
+
+Ensemble predictions:
+```{r}
+ensemble <- data.frame(PassengerID = test$PassengerId, RandomForest = as.vector(prediction_rf), SVM = as.vector(prediction_SVM), GBM = as.vector(prediction_GBM))
+
+survived <- c()
+for(i in 1:nrow(ensemble)){
+  if(as.numeric(ensemble$RandomForest[i])-1 + as.numeric(ensemble$SVM[i])-1 + as.numeric(ensemble$GBM[i])-1 <= 1) {
+    survived[i] = 0
+  } else {
+    survived[i] = 1
+  }
+}
+```
+
+```{r}
+solution <- data.frame(PassengerID = test$PassengerId, Survived = survived)
+
+#write to csv file
+write.csv(solution, file = 'rf_titanic_solution', row.names = F)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
